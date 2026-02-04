@@ -17,7 +17,7 @@ This project implements a secure Two-Factor Authentication (2FA) system using Py
 
 Python 3.x
 
-Flask / FastAPI (whichever you used — change if needed)
+Flask 
 
 bcrypt (password hashing)
 
