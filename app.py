@@ -1,51 +1,74 @@
-from flask import Flask, render_template_string, request, redirect, url_for, session
+from flask import Flask, request, redirect, url_for, session, render_template_string
 from werkzeug.security import generate_password_hash, check_password_hash
-import pyotp, qrcode
-import io, base64
 import sqlite3
-from cryptography.fernet import Fernet
+import pyotp
+import urllib.parse
 
-app = Flask("MyApp")
-app.secret_key = "supersecretkey"
+app = Flask(__name__)
+app.secret_key = "simple-2fa-secret"
 
-fernet= Fernet(Fernet.generate_key())
+# --------------------
+# Database
+# --------------------
 def init_db():
     conn = sqlite3.connect("users.db")
     c = conn.cursor()
-    c.execute(''' CREATE TABLE IF NOT EXISTS usertbl
-              (id INTEGER PRIMARY KEY AUTOINCREMENT,
-              username TEXT UNIQUE,
-              password_hash TEXT,
-              secret TEXT)'''
-              )
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            secret TEXT
+        )
+    """)
     conn.commit()
     conn.close()
-init_db()
 
-def add_user(username, password, secret):
-    conn= sqlite3.connect("users.db")
-    c= conn.cursor()
-    enc_secret= fernet.encrypt(secret.encode()).decode()
-    c.execute ("INSERT INTO usertbl (username,password_hash,secret)VALUES(?,?,?)",
-               (username, generate_password_hash(password),enc_secret))
-    conn.commit()
-    conn.close()
+init_db()
 
 def get_user(username):
     conn = sqlite3.connect("users.db")
     c = conn.cursor()
-    c.execute("SELECT id, username, password_hash, secret FROM usertbl WHERE username=?", (username,))
-    row = c.fetchone()
+    c.execute("SELECT * FROM users WHERE username=?", (username,))
+    user = c.fetchone()
     conn.close()
-    return row
+    return user
 
+# --------------------
+# Helper: CSS style for forms
+# --------------------
+form_style = """
+<div style="max-width:400px; margin:auto; padding:20px; border:1px solid #ccc;
+            border-radius:10px; box-shadow:2px 2px 15px #eee; font-family:Arial;">
+<h2 style="text-align:center; color:#333;">{title}</h2>
+{body}
+<a href='/' style="display:block; text-align:center; margin-top:10px; color:#555;">Back to Home</a>
+</div>
+"""
 
-# Home
+input_style = "style='width:100%; padding:8px; margin:5px 0; border-radius:5px; border:1px solid #ccc;'"
+button_style = "style='width:100%; padding:10px; background-color:#4CAF50; color:white; border:none; border-radius:5px; cursor:pointer;'"
+
+# --------------------
+# Routes
+# --------------------
 @app.route("/")
 def home():
-    if "username" in session:
-        return f"✅ Logged in as {session['username']} <a href='/logout'>Logout</a>"
-    return "<a href='/register'>Register</a> | <a href='/login'>Login</a>"
+    if "user" in session:
+        return f"""
+        <div style='text-align:center; font-family:Arial; margin-top:50px;'>
+            <h2>Welcome, {session['user']} ✅</h2>
+            <a href='/logout' style='text-decoration:none; color:white; background-color:#f44336;
+               padding:10px 20px; border-radius:5px;'>Logout</a>
+        </div>
+        """
+    return """
+    <div style='text-align:center; font-family:Arial; margin-top:50px;'>
+        <h2>Welcome to Simple 2FA Demo</h2>
+        <a href='/register' style='margin:0 10px;'>Register</a> | 
+        <a href='/login' style='margin:0 10px;'>Login</a>
+    </div>
+    """
 
 # Register
 @app.route("/register", methods=["GET", "POST"])
@@ -55,43 +78,52 @@ def register():
         password = request.form["password"]
 
         if get_user(username):
-            return "⚠️ User already exists!"
+            return render_template_string(form_style.format(
+                title="Register",
+                body="<p style='color:red;'>❌ User already exists!</p>"
+            ))
+
         secret = pyotp.random_base32()
-        add_user(username,password,secret)
-        return redirect(url_for("qrcode_page",username=username))
 
-    return '''
-        <form method="post">
-            Username: <input type="text" name="username"><br>
-            Password: <input type="password" name="password"><br>
-            <input type="submit" value="Register">
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO users (username, password_hash, secret) VALUES (?, ?, ?)",
+            (username, generate_password_hash(password), secret)
+        )
+        conn.commit()
+        conn.close()
+
+        totp = pyotp.TOTP(secret)
+        uri = totp.provisioning_uri(name=username, issuer_name="Simple2FA")
+        qr_url = (
+            "https://api.qrserver.com/v1/create-qr-code/"
+            "?size=200x200&data=" + urllib.parse.quote(uri)
+        )
+
+        return render_template_string(form_style.format(
+            title="2FA QR Code",
+            body=f"""
+                <p style='text-align:center;'>Scan this QR code using Google Authenticator:</p>
+                <img src="{qr_url}" style='display:block; margin:auto;'><br>
+                <p style='text-align:center;'>Then <a href='/login'>Login</a></p>
+            """
+        ))
+
+    return render_template_string(form_style.format(
+        title="Register New User",
+        body=f"""
+        <form method='post'>
+            <label>Username:</label><br>
+            <input name='username' {input_style} required><br>
+            
+            <label>Password:</label><br>
+            <input type='password' name='password' {input_style} required><br><br>
+            
+            <input type='submit' value='Register' {button_style}>
         </form>
-    '''
-
-# Show QR Code for Google Authenticator
-@app.route("/qrcode/<username>")
-def qrcode_page(username):
-    user= get_user(username)
-    if not user:
-        return "User not found!"
-
-    enc_secret= user[3]
-    secret = fernet.decrypt(enc_secret.encode()).decode()
-    totp = pyotp.TOTP(secret)
-    uri = totp.provisioning_uri(name=username, issuer_name="My2FAApp")
-
-    # Generate QR code as base64
-    img = qrcode.make(uri)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    qr_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    return render_template_string('''
-        <h2>Scan this QR Code with Google Authenticator</h2>
-        <img src="data:image/png;base64,{{qr_b64}}">
-        <p>Or use this secret: <b>{{secret}}</b></p>
-        <a href="/login">Go to Login</a>
-    ''', qr_b64=qr_b64, secret=secret)
+        """
+    ))
 
 # Login
 @app.route("/login", methods=["GET", "POST"])
@@ -101,33 +133,47 @@ def login():
         password = request.form["password"]
         otp = request.form["otp"]
 
-        user= get_user(username)
-        if user and check_password_hash(user[2], password):
-            enc_secret= user[3]
-            secret= fernet.decrypt(enc_secret.encode()).decode()
-            totp = pyotp.TOTP(secret)
-            if totp.verify(otp):
-                session["username"] = username
-                return redirect(url_for("home"))
-            else:
-                return "❌ Invalid OTP!"
-        else:
-            return "❌ Invalid credentials!"
+        user = get_user(username)
+        if not user or not check_password_hash(user[2], password):
+            return render_template_string(form_style.format(
+                title="Login",
+                body="<p style='color:red;'>❌ Invalid username or password</p>"
+            ))
 
-    return '''
-        <form method="post">
-            Username: <input type="text" name="username"><br>
-            Password: <input type="password" name="password"><br>
-            OTP: <input type="text" name="otp"><br>
-            <input type="submit" value="Login">
+        totp = pyotp.TOTP(user[3])
+        if not totp.verify(otp):
+            return render_template_string(form_style.format(
+                title="Login",
+                body="<p style='color:red;'>❌ Invalid OTP</p>"
+            ))
+
+        session["user"] = username
+        return redirect(url_for("home"))
+
+    return render_template_string(form_style.format(
+        title="Login",
+        body=f"""
+        <form method='post'>
+            <label>Username:</label><br>
+            <input name='username' {input_style} required><br>
+            
+            <label>Password:</label><br>
+            <input type='password' name='password' {input_style} required><br>
+            
+            <label>OTP (Google Authenticator):</label><br>
+            <input name='otp' {input_style} required><br><br>
+            
+            <input type='submit' value='Login' {button_style}>
         </form>
-    '''
+        """
+    ))
 
 # Logout
 @app.route("/logout")
 def logout():
-    session.pop("username", None)
+    session.pop("user", None)
     return redirect(url_for("home"))
 
 if __name__ == "__main__":
     app.run(debug=True)
+
